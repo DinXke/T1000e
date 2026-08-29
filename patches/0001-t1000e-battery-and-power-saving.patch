@@ -1,0 +1,920 @@
+diff --git a/examples/companion_radio/MyMesh.cpp b/examples/companion_radio/MyMesh.cpp
+index 2c33406..d94fa41 100644
+--- a/examples/companion_radio/MyMesh.cpp
++++ b/examples/companion_radio/MyMesh.cpp
+@@ -1,4 +1,5 @@
+ #include "MyMesh.h"
++#include <helpers/BatteryCurve.h>
+ 
+ #include <Arduino.h> // needed for PlatformIO
+ #include <Mesh.h>
+@@ -653,6 +654,8 @@ uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_tim
+ 
+     if (permissions & TELEM_PERM_BASE) { // only respond if base permission bit is set
+       telemetry.reset();
++      // Remote telemetry request from another node: always the true voltage.
++      // Someone monitoring this node from elsewhere needs the real number.
+       telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)board.getBattMilliVolts() / 1000.0f);
+       // query other sensors -- target specific
+       sensors.querySensors(permissions, telemetry);
+@@ -934,6 +937,11 @@ void MyMesh::begin(bool has_display) {
+ 
+   // load persisted prefs
+   _store->loadPrefs(_prefs);
++
++  // Re-apply the saved battery calibration. Without this the value is stored
++  // but never used again after a reboot, which is worse than not having it:
++  // the reading silently reverts to the nominal divider.
++  board.setAdcMultiplier(_prefs.adc_multiplier);
+   sensors.node_lat = _prefs.node_lat;
+   sensors.node_lon = _prefs.node_lon;
+ 
+@@ -1470,15 +1478,37 @@ void MyMesh::handleCmdFrame(size_t len) {
+     }
+     board.reboot();
+   } else if (cmd_frame[0] == CMD_GET_BATT_AND_STORAGE) {
+-    uint8_t reply[11];
++    uint8_t reply[14];
+     int i = 0;
+     reply[i++] = RESP_CODE_BATT_AND_STORAGE;
+-    uint16_t battery_millivolts = board.getBattMilliVolts();
++    uint16_t true_mv = board.getBattMilliVolts();
++    uint8_t  batt_pct = battery_percent_from_mv(true_mv);
++#if BATTERY_PERCENT_SPOOF
++    // Companion apps turn this field into a percentage with a straight line
++    // from 3000mV to 4200mV, which is not how a LiPo discharges. Report the
++    // millivolt value that makes that line land on the real state of charge.
++    // The true reading is still available: in the extension fields below, in
++    // the STATS_TYPE_CORE frame, in telemetry, and over the CLI.
++    uint16_t battery_millivolts = battery_display_mv(true_mv);
++#else
++    uint16_t battery_millivolts = true_mv;
++#endif
+     uint32_t used = _store->getStorageUsedKb();
+     uint32_t total = _store->getStorageTotalKb();
+     memcpy(&reply[i], &battery_millivolts, 2); i += 2;
+     memcpy(&reply[i], &used, 4); i += 4;
+     memcpy(&reply[i], &total, 4); i += 4;
++#if BATTERY_EXT_FRAME
++    // Backwards-compatible extension. The documented frame is 11 bytes and
++    // every parser either slices the first 11 or checks len >= 11, so trailing
++    // bytes are ignored by apps that do not know about them. An app that does
++    // know can read the true state of charge straight off the wire and skip
++    // the voltage-to-percent guesswork entirely.
++    reply[i++] = batt_pct;                        // byte 11: 0..100
++    memcpy(&reply[i], &true_mv, 2); i += 2;       // bytes 12-13: unspoofed mV
++#else
++    (void) batt_pct;
++#endif
+     _serial->writeFrame(reply, i);
+   } else if (cmd_frame[0] == CMD_EXPORT_PRIVATE_KEY) {
+ #if ENABLE_PRIVATE_KEY_EXPORT
+@@ -1650,7 +1680,17 @@ void MyMesh::handleCmdFrame(size_t len) {
+     }
+   } else if (cmd_frame[0] == CMD_SEND_TELEMETRY_REQ && len == 4) {  // 'self' telemetry request
+     telemetry.reset();
++    // This is the telemetry the *connected app* shows for this device, and it
++    // renders it as "<percent> / <volts>" using the same linear map as the
++    // battery gauge. Report the same spoofed value here, otherwise the app
++    // contradicts itself: the gauge says 0% while its own telemetry page says
++    // 20% off a 3.25V reading. The reply to a *remote* telemetry request over
++    // the mesh (further up) stays truthful -- see docs/battery.md.
++#if BATTERY_TELEMETRY_SPOOF
++    telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)battery_display_mv(board.getBattMilliVolts()) / 1000.0f);
++#else
+     telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)board.getBattMilliVolts() / 1000.0f);
++#endif
+     float temperature = board.getMCUTemperature();
+     if(!isnan(temperature)) { // Supported boards with built-in temperature sensor. ESP32-C3 may return NAN
+       telemetry.addTemperature(TELEM_CHANNEL_SELF, temperature); // Built-in MCU Temperature
+@@ -1868,6 +1908,8 @@ void MyMesh::handleCmdFrame(size_t len) {
+       int i = 0;
+       out_frame[i++] = RESP_CODE_STATS;
+       out_frame[i++] = STATS_TYPE_CORE;
++      // Deliberately NOT spoofed: this is the diagnostics frame, and it stays
++      // the place to read the cell's actual voltage. Same for telemetry.
+       uint16_t battery_mv = board.getBattMilliVolts();
+       uint32_t uptime_secs = _ms->getMillis() / 1000;
+       uint8_t queue_len = (uint8_t)_mgr->getOutboundTotal();
+@@ -2050,9 +2092,61 @@ void MyMesh::checkCLIRescueCmd() {
+         _prefs.ble_pin = atoi(&config[4]);
+         savePrefs();
+         Serial.printf("  > pin is now %06d\n", _prefs.ble_pin);
++      } else if (memcmp(config, "batt.calibrate ", 15) == 0) {
++        // Measure the cell with a multimeter, pass the real value in mV.
++        // The discharge curve, the low-battery warning and the shutdown
++        // threshold are all only as good as this number.
++        long actual_mv = atol(&config[15]);
++        uint16_t reported_mv = board.getBattMilliVolts();
++        float cur_mult = board.getAdcMultiplier();
++        if (actual_mv < 2500 || actual_mv > 4500) {
++          Serial.println("  Error: expected a measured value between 2500 and 4500 mV");
++        } else if (reported_mv < 1000 || cur_mult == 0.0f) {
++          Serial.println("  Error: no usable battery reading to calibrate against");
++        } else {
++          float new_mult = cur_mult * ((float) actual_mv / (float) reported_mv);
++          if (new_mult <= 0.0f || new_mult > 10.0f) {
++            Serial.println("  Error: implied multiplier out of range");
++          } else if (board.setAdcMultiplier(new_mult)) {
++            _prefs.adc_multiplier = new_mult;
++            savePrefs();
++            Serial.printf("  > was %u mV, now %u mV (multiplier %.4f)\n",
++                          (unsigned) reported_mv, (unsigned) board.getBattMilliVolts(), new_mult);
++          } else {
++            Serial.println("  Error: this board has no adjustable battery reading");
++          }
++        }
++      } else if (memcmp(config, "adc.multiplier ", 15) == 0) {
++        float m = atof(&config[15]);
++        if (m < 0.0f || m > 10.0f) {
++          Serial.println("  Error: out of range");
++        } else if (board.setAdcMultiplier(m)) {
++          _prefs.adc_multiplier = m;
++          savePrefs();
++          Serial.printf("  > multiplier is now %.4f\n", board.getAdcMultiplier());
++        } else {
++          Serial.println("  Error: this board has no adjustable battery reading");
++        }
+       } else {
+         Serial.printf("  Error: unknown config: %s\n", config);
+       }
++    } else if (strcmp(cli_command, "batt") == 0) {
++      uint16_t mv = board.getBattMilliVolts();
++      Serial.printf("  > reading   : %u mV (multiplier %.4f)\n", (unsigned) mv, board.getAdcMultiplier());
++      Serial.printf("  > charge    : %u %%\n", (unsigned) battery_percent_from_mv(mv));
++#if BATTERY_PERCENT_SPOOF
++      Serial.printf("  > to the app: %u mV (spoofed so its linear map lands on the real %%)\n",
++                    (unsigned) battery_display_mv(mv));
++#else
++      Serial.println("  > to the app: same reading (spoofing disabled)");
++#endif
++#ifdef LOW_BATT_WARN_MILLIVOLTS
++      Serial.printf("  > warn below: %u mV\n", (unsigned) LOW_BATT_WARN_MILLIVOLTS);
++#endif
++#ifdef AUTO_SHUTDOWN_MILLIVOLTS
++      Serial.printf("  > stop below: %u mV\n", (unsigned) AUTO_SHUTDOWN_MILLIVOLTS);
++#endif
++      Serial.printf("  > external  : %s\n", board.isExternalPowered() ? "yes" : "no");
+     } else if (strcmp(cli_command, "rebuild") == 0) {
+       bool success = _store->formatFileSystem();
+       if (success) {
+diff --git a/examples/companion_radio/NodePrefs.h b/examples/companion_radio/NodePrefs.h
+index 21766de..fe551fd 100644
+--- a/examples/companion_radio/NodePrefs.h
++++ b/examples/companion_radio/NodePrefs.h
+@@ -40,6 +40,10 @@ public:
+   uint8_t autoadd_max_hops = 0;  // 0 = no limit, 1 = direct (0 hops), N = up to N-1 hops (max 64)
+   char default_scope_name[31];
+   uint8_t default_scope_key[16];
++  // Per-unit ADC scaling for the battery reading; 0 means "use the board
++  // default". Everything the discharge curve concludes rests on this, so it
++  // has to survive a reboot. See docs/battery.md.
++  float adc_multiplier = 0;
+ 
+ private:
+   class RadioPrefs : public ConfigSerializer {  // COPIED from CommonCLI (for now)
+@@ -115,6 +119,7 @@ private:
+       def("tel_base", _parent->telemetry_mode_base);
+       def("tel_loc", _parent->telemetry_mode_loc);
+       def("tel_env", _parent->telemetry_mode_env);
++      def("adc_mult", _parent->adc_multiplier);
+     }
+   public:
+     CompanionPrefs(NodePrefs* parent) : _parent(parent) { }
+diff --git a/examples/companion_radio/ui-orig/UITask.cpp b/examples/companion_radio/ui-orig/UITask.cpp
+index b49b05d..29d2d31 100644
+--- a/examples/companion_radio/ui-orig/UITask.cpp
++++ b/examples/companion_radio/ui-orig/UITask.cpp
+@@ -1,11 +1,35 @@
+ #include "UITask.h"
+ #include <Arduino.h>
+ #include <helpers/TxtDataHelpers.h>
++#include <helpers/BatteryCurve.h>
+ #include "../MyMesh.h"
+ 
+ #define AUTO_OFF_MILLIS     15000   // 15 seconds
+ #define BOOT_SCREEN_MILLIS   3000   // 3 seconds
+ 
++// How often the battery watchdog looks at the cell.
++#ifndef BATT_WATCH_MILLIS
++#define BATT_WATCH_MILLIS    8000
++#endif
++
++// AUTO_SHUTDOWN_MILLIVOLTS has to be seen this many times in a row before the
++// device powers itself down. A single sample taken during a LoRa TX burst can
++// dip well below the threshold on a cell that is otherwise fine; requiring a
++// streak means a real, sustained low cell shuts down and a transmit sag does
++// not. (The board-level median filter already removes most of it; this is the
++// second line of defence, because the cost of getting it wrong is the device
++// switching itself off mid-conversation.)
++#ifndef AUTO_SHUTDOWN_READINGS
++#define AUTO_SHUTDOWN_READINGS  3
++#endif
++
++#ifdef PIN_BUZZER
++// Descending minor third, twice: distinct from both startup and shutdown.
++#ifndef LOW_BATT_SONG
++#define LOW_BATT_SONG  "LowBatt:d=4,o=5,b=100:8a4,8f4,16p,8a4,8f4"
++#endif
++#endif
++
+ #if defined(PIN_STATUS_LED) || defined(PIN_STATUS_LED_R)
+ #define LED_ON_MILLIS     20
+ #define LED_ON_MSG_MILLIS 200
+@@ -165,6 +189,11 @@ void UITask::newMsg(uint8_t path_len, const char* from_name, const char* text, i
+ }
+ 
+ void UITask::renderBatteryIndicator(uint16_t batteryMilliVolts) {
++#if BATTERY_USE_CURVE
++  // State of charge from the LiPo discharge curve rather than a straight line
++  // between 3.0V and 4.2V -- see src/helpers/BatteryCurve.h.
++  int batteryPercentage = battery_percent_from_mv(batteryMilliVolts);
++#else
+   // Convert millivolts to percentage
+ #ifndef BATT_MIN_MILLIVOLTS
+   #define BATT_MIN_MILLIVOLTS 3000
+@@ -177,6 +206,7 @@ void UITask::renderBatteryIndicator(uint16_t batteryMilliVolts) {
+   int batteryPercentage = ((batteryMilliVolts - minMilliVolts) * 100) / (maxMilliVolts - minMilliVolts);
+   if (batteryPercentage < 0) batteryPercentage = 0; // Clamp to 0%
+   if (batteryPercentage > 100) batteryPercentage = 100; // Clamp to 100%
++#endif
+ 
+   // battery icon
+   int iconWidth = 24;
+@@ -433,7 +463,69 @@ void UITask::shutdown(bool restart){
+   }
+ }
+ 
++/*
++  Low-battery warning and protective shutdown.
++
++  Without this, a T1000-E on a flat cell simply browns out: no warning, no tune,
++  and a flash write in progress at that moment can take the filesystem with it.
++  The stock ui-orig had no battery watchdog at all -- AUTO_SHUTDOWN_MILLIVOLTS
++  was only ever honoured by ui-tiny and ui-new, neither of which this board
++  builds.
++*/
++void UITask::batteryWatchdog() {
++#if defined(AUTO_SHUTDOWN_MILLIVOLTS) || defined(LOW_BATT_WARN_MILLIVOLTS)
++  unsigned long now = millis();
++  // Signed difference, so the watchdog survives the millis() wrap at ~49 days
++  // rather than going quiet for the rest of the device's uptime.
++  if ((long)(now - _next_batt_watch) < 0) return;
++  _next_batt_watch = now + BATT_WATCH_MILLIS;
++
++#ifdef LOW_BATT_WARN_MILLIVOLTS
++  const uint16_t warn_mv = LOW_BATT_WARN_MILLIVOLTS;
++#else
++  const uint16_t warn_mv = 0;
++#endif
++#ifdef AUTO_SHUTDOWN_MILLIVOLTS
++  const uint16_t stop_mv = AUTO_SHUTDOWN_MILLIVOLTS;
++#else
++  const uint16_t stop_mv = 0;
++#endif
++
++  uint16_t mv = _board->getBattMilliVolts();
++
++  batt_watch_state_t st;
++  st.low_streak = _batt_low_streak;
++  st.warned = _low_batt_warned ? 1 : 0;
++
++  batt_action_t action = battery_watch_step(&st, mv, _board->isExternalPowered() ? 1 : 0,
++                                            warn_mv, stop_mv, AUTO_SHUTDOWN_READINGS);
++
++  _batt_low_streak = st.low_streak;
++  _low_batt_warned = (st.warned != 0);
++
++  if (action == BATT_ACTION_WARN) {
++    sprintf(_alert, "Battery low: %u%%", (unsigned) battery_percent_from_mv(mv));
++    _need_refresh = true;
++  #ifdef PIN_BUZZER
++    buzzer.play(LOW_BATT_SONG);
++  #endif
++    MESH_DEBUG_PRINTLN("UITask: low battery warning at %u mV", (unsigned) mv);
++  } else if (action == BATT_ACTION_SHUTDOWN) {
++    MESH_DEBUG_PRINTLN("UITask: battery critical (%u mV) - shutting down", (unsigned) mv);
++    sprintf(_alert, "Battery empty");
++    if (_display != NULL && _display->isOn()) {
++      _display->startFrame();
++      renderCurrScreen();
++      _display->endFrame();
++    }
++    shutdown();   // plays the shutdown tune, then powers the board off
++  }
++#endif
++}
++
+ void UITask::loop() {
++  batteryWatchdog();
++
+   #ifdef PIN_USER_BTN
+     if (_userButton) {
+       _userButton->update();
+diff --git a/examples/companion_radio/ui-orig/UITask.h b/examples/companion_radio/ui-orig/UITask.h
+index 02d126e..af44de6 100644
+--- a/examples/companion_radio/ui-orig/UITask.h
++++ b/examples/companion_radio/ui-orig/UITask.h
+@@ -46,9 +46,14 @@ class UITask : public AbstractUITask {
+   Button* _userButtonAnalog = nullptr;
+ #endif
+ 
++  unsigned long _next_batt_watch = 0;
++  uint8_t _batt_low_streak = 0;
++  bool _low_batt_warned = false;
++
+   void renderCurrScreen();
+   void userLedHandler();
+   void renderBatteryIndicator(uint16_t batteryMilliVolts);
++  void batteryWatchdog();
+   
+   // Button action handlers
+   void handleButtonAnyPress();
+diff --git a/src/helpers/CommonCLI.cpp b/src/helpers/CommonCLI.cpp
+index b318bb5..8cdc610 100644
+--- a/src/helpers/CommonCLI.cpp
++++ b/src/helpers/CommonCLI.cpp
+@@ -1,5 +1,6 @@
+ #include <Arduino.h>
+ #include "CommonCLI.h"
++#include "BatteryCurve.h"
+ #include "TxtDataHelpers.h"
+ #include "AdvertDataHelpers.h"
+ #include "TxtDataHelpers.h"
+@@ -763,6 +764,32 @@ void CommonCLI::handleSetCmd(uint32_t sender_timestamp, char* command, char* rep
+     savePrefs();
+     strcpy(reply, "OK");
+ #endif
++  } else if (memcmp(config, "batt.calibrate ", 15) == 0) {
++    // One-shot per-unit calibration: measure the cell with a multimeter and
++    // pass the real figure in millivolts. Everything downstream -- the
++    // discharge curve, the low-battery warning, the shutdown threshold -- is
++    // only as good as this number, and a nominal divider is routinely off by
++    // enough to shift the whole curve.
++    long actual_mv = atol(&config[15]);
++    uint16_t reported_mv = _board->getBattMilliVolts();
++    float cur_mult = _board->getAdcMultiplier();
++    if (actual_mv < 2500 || actual_mv > 4500) {
++      strcpy(reply, "Error: expected a measured value between 2500 and 4500 mV");
++    } else if (reported_mv < 1000 || cur_mult == 0.0f) {
++      strcpy(reply, "Error: no usable battery reading to calibrate against");
++    } else {
++      float new_mult = cur_mult * ((float) actual_mv / (float) reported_mv);
++      if (new_mult <= 0.0f || new_mult > 10.0f) {
++        strcpy(reply, "Error: implied multiplier out of range");
++      } else if (_board->setAdcMultiplier(new_mult)) {
++        _prefs->adc_multiplier = new_mult;
++        savePrefs();
++        sprintf(reply, "OK - was %u mV, now %u mV (multiplier %.4f)",
++                (unsigned) reported_mv, (unsigned) _board->getBattMilliVolts(), new_mult);
++      } else {
++        strcpy(reply, "Error: unsupported");
++      }
++    }
+   } else if (memcmp(config, "adc.multiplier ", 15) == 0) {
+     _prefs->adc_multiplier = atof(&config[15]);
+     if (_board->setAdcMultiplier(_prefs->adc_multiplier)) {
+@@ -950,6 +977,18 @@ void CommonCLI::handleGetCmd(uint32_t sender_timestamp, char* command, char* rep
+     } else {
+       sprintf(reply, "> %.3f", adc_mult);
+     }
++  // Battery state of charge (see src/helpers/BatteryCurve.h)
++  } else if (memcmp(config, "batt.mv", 7) == 0) {
++    sprintf(reply, "> %u mV", (unsigned) _board->getBattMilliVolts());
++  } else if (memcmp(config, "batt.pct", 8) == 0) {
++    sprintf(reply, "> %u %%", (unsigned) battery_percent_from_mv(_board->getBattMilliVolts()));
++  } else if (memcmp(config, "batt.reported", 13) == 0) {
++    uint16_t mv = _board->getBattMilliVolts();
++#if BATTERY_PERCENT_SPOOF
++    sprintf(reply, "> %u mV (spoofed from %u mV)", (unsigned) battery_display_mv(mv), (unsigned) mv);
++#else
++    sprintf(reply, "> %u mV (not spoofed)", (unsigned) mv);
++#endif
+   // Power management commands
+   } else if (memcmp(config, "pwrmgt.support", 14) == 0) {
+ #ifdef NRF52_POWER_MANAGEMENT
+diff --git a/src/helpers/nrf52/SerialBLEInterface.cpp b/src/helpers/nrf52/SerialBLEInterface.cpp
+index 75a4e3b..dd6edcb 100644
+--- a/src/helpers/nrf52/SerialBLEInterface.cpp
++++ b/src/helpers/nrf52/SerialBLEInterface.cpp
+@@ -19,6 +19,60 @@
+ #define BLE_ADV_INTERVAL_MAX       244    // 152.5ms (units: 0.625ms)
+ #define BLE_ADV_FAST_TIMEOUT       30     // seconds
+ 
++/* ---------------------------------------------------------------------------
++   BLE power saving (opt-in per variant with -D BLE_POWER_SAVING=1)
++
++   Two changes, both of which only affect the radio's duty cycle:
++
++   1. Slow advertising. Stock advertises at 20ms for the first 30 seconds and
++      then at 152.5ms forever. A companion node spends most of its life
++      disconnected and advertising, so that steady-state rate is what actually
++      drains the cell. Dropping it to one advertisement per second cuts the
++      advertising duty cycle by roughly 6x. Discovery still starts at 20ms for
++      the first 30 seconds after boot and after every disconnect, so pairing
++      and reconnecting feel the same.
++
++   2. Idle connection parameters. While an app is connected but nothing is
++      being exchanged, renegotiate to a longer connection interval with slave
++      latency, and go back to the fast parameters the moment a frame moves in
++      either direction. Costs up to about a second of extra latency on the
++      first frame after an idle period; saves the radio waking every 30ms to
++      exchange empty packets for as long as the app stays connected.
++   --------------------------------------------------------------------------- */
++#ifndef BLE_POWER_SAVING
++  #define BLE_POWER_SAVING 0
++#endif
++
++#if BLE_POWER_SAVING
++  #ifndef BLE_ADV_INTERVAL_SLOW
++    #define BLE_ADV_INTERVAL_SLOW    1600   // 1000ms (units: 0.625ms)
++  #endif
++  // Quiet time before the connection is downshifted.
++  #ifndef BLE_IDLE_MILLIS
++    #define BLE_IDLE_MILLIS          20000
++  #endif
++  // Idle connection parameters (interval units 1.25ms, timeout units 10ms).
++  // Supervision timeout must exceed (1 + latency) * max_interval * 2:
++  // (1 + 4) * 200ms * 2 = 2000ms, comfortably inside the 6000ms below.
++  #ifndef BLE_IDLE_MIN_CONN_INTERVAL
++    #define BLE_IDLE_MIN_CONN_INTERVAL   80    // 100ms
++  #endif
++  #ifndef BLE_IDLE_MAX_CONN_INTERVAL
++    #define BLE_IDLE_MAX_CONN_INTERVAL   160   // 200ms
++  #endif
++  #ifndef BLE_IDLE_SLAVE_LATENCY
++    #define BLE_IDLE_SLAVE_LATENCY       4
++  #endif
++  #ifndef BLE_IDLE_CONN_SUP_TIMEOUT
++    #define BLE_IDLE_CONN_SUP_TIMEOUT    600   // 6000ms
++  #endif
++  // The SoftDevice will not accept back-to-back parameter updates; keep a
++  // floor between requests so a burst of traffic cannot thrash the link.
++  #ifndef BLE_CONN_PARAM_MIN_GAP
++    #define BLE_CONN_PARAM_MIN_GAP       2000
++  #endif
++#endif
++
+ // RX drain buffer size for overflow protection
+ #define BLE_RX_DRAIN_BUF_SIZE      32
+ 
+@@ -29,6 +83,9 @@ void SerialBLEInterface::onConnect(uint16_t connection_handle) {
+   if (instance) {
+     instance->_conn_handle = connection_handle;
+     instance->_isDeviceConnected = false;
++    instance->_conn_params_idle = false;
++    instance->_last_ble_activity = millis();
++    instance->_last_conn_param_req = millis();
+     instance->clearBuffers();
+   }
+ }
+@@ -39,6 +96,7 @@ void SerialBLEInterface::onDisconnect(uint16_t connection_handle, uint8_t reason
+     if (instance->_conn_handle == connection_handle) {
+       instance->_conn_handle = BLE_CONN_HANDLE_INVALID;
+       instance->_isDeviceConnected = false;
++      instance->_conn_params_idle = false;
+       instance->clearBuffers();
+     }
+   }
+@@ -49,6 +107,8 @@ void SerialBLEInterface::onSecured(uint16_t connection_handle) {
+   if (instance) {
+     if (instance->isValidConnection(connection_handle, true)) {
+       instance->_isDeviceConnected = true;
++      instance->_conn_params_idle = false;
++      instance->_last_ble_activity = millis();
+       
+       // Connection interval units: 1.25ms, supervision timeout units: 10ms
+       // Apple: "The product will not read or use the parameters in the Peripheral Preferred Connection Parameters characteristic."
+@@ -194,7 +254,11 @@ void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code
+ 
+   Bluefruit.ScanResponse.addName();
+ 
++#if BLE_POWER_SAVING
++  Bluefruit.Advertising.setInterval(BLE_ADV_INTERVAL_MIN, BLE_ADV_INTERVAL_SLOW);
++#else
+   Bluefruit.Advertising.setInterval(BLE_ADV_INTERVAL_MIN, BLE_ADV_INTERVAL_MAX);
++#endif
+   Bluefruit.Advertising.setFastTimeout(BLE_ADV_FAST_TIMEOUT);
+ 
+   Bluefruit.Advertising.restartOnDisconnect(true);
+@@ -295,7 +359,62 @@ size_t SerialBLEInterface::writeFrame(const uint8_t src[], size_t len) {
+   return 0;
+ }
+ 
++void SerialBLEInterface::applyConnParams(bool idle) {
++#if BLE_POWER_SAVING
++  if (_conn_handle == BLE_CONN_HANDLE_INVALID) return;
++
++  ble_gap_conn_params_t p;
++  if (idle) {
++    p.min_conn_interval = BLE_IDLE_MIN_CONN_INTERVAL;
++    p.max_conn_interval = BLE_IDLE_MAX_CONN_INTERVAL;
++    p.slave_latency     = BLE_IDLE_SLAVE_LATENCY;
++    p.conn_sup_timeout  = BLE_IDLE_CONN_SUP_TIMEOUT;
++  } else {
++    p.min_conn_interval = BLE_MIN_CONN_INTERVAL;
++    p.max_conn_interval = BLE_MAX_CONN_INTERVAL;
++    p.slave_latency     = BLE_SLAVE_LATENCY;
++    p.conn_sup_timeout  = BLE_CONN_SUP_TIMEOUT;
++  }
++
++  _last_conn_param_req = millis();
++  uint32_t err = sd_ble_gap_conn_param_update(_conn_handle, &p);
++  if (err == NRF_SUCCESS) {
++    _conn_params_idle = idle;
++    BLE_DEBUG_PRINTLN("conn params -> %s (%u-%ums, latency=%u)",
++                      idle ? "idle" : "active",
++                      p.min_conn_interval * 5 / 4, p.max_conn_interval * 5 / 4,
++                      p.slave_latency);
++  } else {
++    // Busy or rejected: leave the flag alone and try again next window.
++    BLE_DEBUG_PRINTLN("conn param update failed: %lu", (unsigned long) err);
++  }
++#else
++  (void) idle;
++#endif
++}
++
++void SerialBLEInterface::updatePowerState() {
++#if BLE_POWER_SAVING
++  if (!isConnected()) {
++    _conn_params_idle = false;
++    return;
++  }
++
++  unsigned long now = millis();
++  bool busy = (send_queue_len > 0 || recv_queue_len > 0);
++  if (busy) _last_ble_activity = now;
++
++  bool want_idle = !busy && (now - _last_ble_activity >= BLE_IDLE_MILLIS);
++  if (want_idle == _conn_params_idle) return;
++  if (now - _last_conn_param_req < BLE_CONN_PARAM_MIN_GAP) return;
++
++  applyConnParams(want_idle);
++#endif
++}
++
+ size_t SerialBLEInterface::checkRecvFrame(uint8_t dest[]) {
++  updatePowerState();
++
+   if (send_queue_len > 0) {
+     if (!isConnected()) {
+       BLE_DEBUG_PRINTLN("writeBytes: connection invalid, clearing send queue");
+diff --git a/src/helpers/nrf52/SerialBLEInterface.h b/src/helpers/nrf52/SerialBLEInterface.h
+index de10305..2096ac3 100644
+--- a/src/helpers/nrf52/SerialBLEInterface.h
++++ b/src/helpers/nrf52/SerialBLEInterface.h
+@@ -15,6 +15,9 @@ class SerialBLEInterface : public BaseSerialInterface {
+   uint16_t _conn_handle;
+   unsigned long _last_health_check;
+   unsigned long _last_retry_attempt;
++  unsigned long _last_ble_activity;
++  unsigned long _last_conn_param_req;
++  bool _conn_params_idle;
+ 
+   struct Frame {
+     uint8_t len;
+@@ -34,6 +37,8 @@ class SerialBLEInterface : public BaseSerialInterface {
+   void shiftRecvQueueLeft();
+   bool isValidConnection(uint16_t handle, bool requireWaitingForSecurity = false) const;
+   bool isAdvertising() const;
++  void applyConnParams(bool idle);
++  void updatePowerState();
+   static void onConnect(uint16_t connection_handle);
+   static void onDisconnect(uint16_t connection_handle, uint8_t reason);
+   static void onSecured(uint16_t connection_handle);
+@@ -49,6 +54,9 @@ public:
+     _conn_handle = BLE_CONN_HANDLE_INVALID;
+     _last_health_check = 0;
+     _last_retry_attempt = 0;
++    _last_ble_activity = 0;
++    _last_conn_param_req = 0;
++    _conn_params_idle = false;
+     send_queue_len = 0;
+     recv_queue_len = 0;
+   }
+diff --git a/variants/t1000-e/T1000eBoard.cpp b/variants/t1000-e/T1000eBoard.cpp
+index 0d390f7..dc1af1a 100644
+--- a/variants/t1000-e/T1000eBoard.cpp
++++ b/variants/t1000-e/T1000eBoard.cpp
+@@ -3,6 +3,55 @@
+ 
+ #include "T1000eBoard.h"
+ 
++void T1000eBoard::powerDownRails() {
++#ifdef HAS_GPS
++  digitalWrite(GPS_VRTC_EN, LOW);
++  digitalWrite(GPS_RESET, LOW);
++  digitalWrite(GPS_SLEEP_INT, LOW);
++  digitalWrite(GPS_RTC_INT, LOW);
++  digitalWrite(GPS_EN, LOW);
++#endif
++#ifdef BUZZER_EN
++  digitalWrite(BUZZER_EN, LOW);
++#endif
++#ifdef PIN_3V3_EN
++  digitalWrite(PIN_3V3_EN, LOW);
++#endif
++#ifdef PIN_3V3_ACC_EN
++  digitalWrite(PIN_3V3_ACC_EN, LOW);
++#endif
++#ifdef SENSOR_EN
++  digitalWrite(SENSOR_EN, LOW);
++#endif
++}
++
++#ifdef NRF52_POWER_MANAGEMENT
++const PowerMgtConfig power_config = {
++  .lpcomp_ain_channel = PWRMGT_LPCOMP_AIN,
++  .lpcomp_refsel      = PWRMGT_LPCOMP_REFSEL,
++  .voltage_bootlock   = PWRMGT_VOLTAGE_BOOTLOCK
++};
++
++void T1000eBoard::initiateShutdown(uint8_t reason) {
++  shutdownPeripherals();   // radio, GPS, display
++  powerDownRails();
++
++  // The button must still be able to bring the device back up, whatever the
++  // reason we are going down for.
++#ifdef BUTTON_PIN
++  nrf_gpio_cfg_sense_input(BUTTON_PIN, NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_SENSE_HIGH);
++#endif
++
++#if PWRMGT_ENABLE_LPCOMP_WAKE
++  if (reason == SHUTDOWN_REASON_LOW_VOLTAGE || reason == SHUTDOWN_REASON_BOOT_PROTECT) {
++    configureVoltageWake(power_config.lpcomp_ain_channel, power_config.lpcomp_refsel);
++  }
++#endif
++
++  enterSystemOff(reason);
++}
++#endif // NRF52_POWER_MANAGEMENT
++
+ void T1000eBoard::begin() {
+   NRF52BoardDCDC::begin();
+   btn_prev_state = HIGH;
+@@ -19,5 +68,10 @@ void T1000eBoard::begin() {
+ 
+   Wire.begin();
+ 
++#ifdef NRF52_POWER_MANAGEMENT
++  // Refuses to return if the cell is too flat to boot safely.
++  checkBootVoltage(&power_config);
++#endif
++
+   delay(10);   // give sx1262 some time to power up
+ }
+\ No newline at end of file
+diff --git a/variants/t1000-e/T1000eBoard.h b/variants/t1000-e/T1000eBoard.h
+index 1111d3c..e0423ea 100644
+--- a/variants/t1000-e/T1000eBoard.h
++++ b/variants/t1000-e/T1000eBoard.h
+@@ -4,15 +4,54 @@
+ #include <Arduino.h>
+ #include <helpers/NRF52Board.h>
+ 
++/* How long a battery reading stays valid. Every call to getBattMilliVolts()
++   powers the sensor rail, blocks for the ADC to settle and then drops the rail
++   again; the companion protocol, the telemetry path and the UI each ask
++   independently, so without a cache the rail is cycled far more often than the
++   reading actually changes. */
++#ifndef BATT_CACHE_MILLIS
++  #define BATT_CACHE_MILLIS  8000
++#endif
++
++/* Number of ADC samples per reading. The LR1110 pulls hard enough during a TX
++   burst to drag a single sample down by a hundred millivolts or more; taking
++   the median of a few samples throws those outliers away instead of letting
++   them reach the discharge curve (or the auto-shutdown check). */
++#ifndef BATT_SAMPLE_COUNT
++  #define BATT_SAMPLE_COUNT  5
++#endif
++
+ class T1000eBoard : public NRF52BoardDCDC {
+ protected:
+   uint8_t btn_prev_state;
+ 
++  uint16_t _batt_cache_mv = 0;
++  unsigned long _batt_cache_at = 0;
++
++  /* Per-unit ADC scaling. Defaults to the board's nominal 2:1 divider, and is
++     overridden by the persisted adc.multiplier preference. The stock T1000-E
++     had no way to correct this at all -- variant.h declares BATTERY_IMMUTABLE,
++     which no code actually reads, and the board simply did not implement
++     setAdcMultiplier(), so "set adc.multiplier" answered "unsupported". A
++     divider that is a few percent off shifts every reading by a hundred
++     millivolts or more, which matters a great deal once a discharge curve is
++     interpreting those millivolts. See docs/battery.md for the procedure. */
++  float adc_mult = ADC_MULTIPLIER;
++
++  // Drop every switched rail on the board. Shared by the user power-off path
++  // and by the power-management shutdown path.
++  void powerDownRails();
++
++#ifdef NRF52_POWER_MANAGEMENT
++  void initiateShutdown(uint8_t reason) override;
++#endif
++
+ public:
+   T1000eBoard() : NRF52Board("T1000E_OTA") {}
+   void begin();
+ 
+-  uint16_t getBattMilliVolts() override {
++  /* Uncached reading: median of BATT_SAMPLE_COUNT samples, one rail cycle. */
++  uint16_t readBattMilliVolts() {
+   #ifdef BATTERY_PIN
+    #ifdef PIN_3V3_EN
+     digitalWrite(PIN_3V3_EN, HIGH);
+@@ -20,20 +59,56 @@ public:
+     analogReference(AR_INTERNAL_3_0);
+     analogReadResolution(12);
+     delay(10);
+-    float volts = (analogRead(BATTERY_PIN) * ADC_MULTIPLIER * AREF_VOLTAGE) / 4096;
++
++    uint16_t raw[BATT_SAMPLE_COUNT];
++    for (int i = 0; i < BATT_SAMPLE_COUNT; i++) {
++      raw[i] = (uint16_t) analogRead(BATTERY_PIN);
++    }
++
+    #ifdef PIN_3V3_EN
+     digitalWrite(PIN_3V3_EN, LOW);
+    #endif
+-
+     analogReference(AR_DEFAULT);  // put back to default
+     analogReadResolution(10);
+ 
+-    return volts * 1000;
++    // insertion sort, then take the middle sample
++    for (int i = 1; i < BATT_SAMPLE_COUNT; i++) {
++      uint16_t v = raw[i];
++      int j = i - 1;
++      while (j >= 0 && raw[j] > v) { raw[j + 1] = raw[j]; j--; }
++      raw[j + 1] = v;
++    }
++    float volts = (raw[BATT_SAMPLE_COUNT / 2] * adc_mult * AREF_VOLTAGE) / 4096;
++
++    return (uint16_t)(volts * 1000);
++  #else
++    return 0;
++  #endif
++  }
++
++  void invalidateBattCache() { _batt_cache_mv = 0; }
++
++  uint16_t getBattMilliVolts() override {
++  #ifdef BATTERY_PIN
++    unsigned long now = millis();
++    if (_batt_cache_mv != 0 && (now - _batt_cache_at) < BATT_CACHE_MILLIS) {
++      return _batt_cache_mv;
++    }
++    _batt_cache_mv = readBattMilliVolts();
++    _batt_cache_at = now;
++    return _batt_cache_mv;
+   #else
+     return 0;
+   #endif
+   }
+ 
++  bool setAdcMultiplier(float multiplier) override {
++    adc_mult = (multiplier == 0.0f) ? (float) ADC_MULTIPLIER : multiplier;
++    invalidateBattCache();   // next read must not come from the old scaling
++    return true;
++  }
++  float getAdcMultiplier() const override { return adc_mult; }
++
+   const char* getManufacturerName() const override {
+     return "Seeed Tracker T1000-E";
+   }
+@@ -50,28 +125,7 @@ public:
+   }
+ 
+   void powerOff() override {
+-    #ifdef HAS_GPS
+-        digitalWrite(GPS_VRTC_EN, LOW);
+-        digitalWrite(GPS_RESET, LOW);
+-        digitalWrite(GPS_SLEEP_INT, LOW);
+-        digitalWrite(GPS_RTC_INT, LOW);
+-        digitalWrite(GPS_EN, LOW);
+-    #endif
+-
+-    #ifdef BUZZER_EN
+-        digitalWrite(BUZZER_EN, LOW);
+-    #endif
+-
+-    #ifdef PIN_3V3_EN
+-        digitalWrite(PIN_3V3_EN, LOW);
+-    #endif
+-
+-    #ifdef PIN_3V3_ACC_EN
+-        digitalWrite(PIN_3V3_ACC_EN, LOW);
+-    #endif
+-    #ifdef SENSOR_EN
+-        digitalWrite(SENSOR_EN, LOW);
+-    #endif
++    powerDownRails();
+ 
+     // set led on and wait for button release before poweroff
+     #ifdef LED_PIN
+diff --git a/variants/t1000-e/platformio.ini b/variants/t1000-e/platformio.ini
+index 8456dc9..33c8385 100644
+--- a/variants/t1000-e/platformio.ini
++++ b/variants/t1000-e/platformio.ini
+@@ -122,6 +122,63 @@ lib_deps = ${t1000-e.lib_deps}
+   stevemarple/MicroNMEA @ ^2.0.6
+   end2endzone/NonBlockingRTTTL@^1.3.0
+ 
++; ---------------------------------------------------------------------------
++; T1000-E companion radio (BLE) with battery-curve reporting and power saving.
++;
++; Same as t1000e_companion_radio_ble, plus:
++;   * LiPo discharge curve instead of a linear 3.0-4.2V map (BatteryCurve)
++;   * a low-battery warning and a protective shutdown, neither of which the
++;     stock ui-orig build had at all
++;   * nRF52 boot-voltage protection and shutdown-reason tracking
++;   * slower BLE advertising, and idle connection parameters while an app is
++;     connected but quiet
++;
++; The stock env above is left untouched, so both can be built and compared.
++; ---------------------------------------------------------------------------
++[env:t1000e_companion_radio_ble_ps]
++extends = t1000-e
++board_build.ldscript = boards/nrf52840_s140_v7_extrafs.ld
++board_upload.maximum_size = 708608
++build_flags = ${t1000-e.build_flags}
++  -I examples/companion_radio/ui-orig
++  -D MAX_CONTACTS=350
++  -D MAX_GROUP_CHANNELS=40
++  -D BLE_PIN_CODE=123456
++  -D BLE_TX_POWER=0
++;  -D BLE_DEBUG_LOGGING=1
++;  -D MESH_PACKET_LOGGING=1
++;  -D MESH_DEBUG=1
++  -D OFFLINE_QUEUE_SIZE=256
++  -D DISPLAY_CLASS=NullDisplayDriver
++  -D PIN_BUZZER=25
++  -D PIN_BUZZER_EN=37      ; P1/5 - required for T1000-E
++  -D ADVERT_NAME='"@@MAC"'
++  ; --- battery ------------------------------------------------------------
++  ; A T1000-E has been observed still running normally at 3250mV, so the
++  ; shutdown threshold sits below that rather than at the 3400 other boards
++  ; use -- cutting a working device off early is its own bug. Read
++  ; docs/battery.md before changing these two, and calibrate first.
++  -D AUTO_SHUTDOWN_MILLIVOLTS=3200   ; power down before the brownout
++  -D LOW_BATT_WARN_MILLIVOLTS=3400   ; warn only, no action
++  -D BATTERY_USE_CURVE=1             ; LiPo curve instead of the linear map
++  -D BATTERY_PERCENT_SPOOF=1         ; make unmodified apps show the real %
++  -D BATTERY_TELEMETRY_SPOOF=1       ; ...including the app's telemetry page
++  -D BATTERY_EXT_FRAME=1             ; also send true % and true mV
++; -D BATT_CURVE_OFFSET_MV=0          ; per-unit calibration, see docs/battery.md
++  ; --- power saving --------------------------------------------------------
++  -D NRF52_POWER_MANAGEMENT
++  -D BLE_POWER_SAVING=1
++build_src_filter = ${t1000-e.build_src_filter}
++  +<helpers/nrf52/SerialBLEInterface.cpp>
++  +<helpers/ui/buzzer.cpp>
++  +<helpers/ui/NullDisplayDriver.cpp>
++  +<../examples/companion_radio/*.cpp>
++  +<../examples/companion_radio/ui-orig/*.cpp>
++lib_deps = ${t1000-e.lib_deps}
++  densaugeo/base64 @ ~1.4.0
++  stevemarple/MicroNMEA @ ^2.0.6
++  end2endzone/NonBlockingRTTTL@^1.3.0
++
+ [env:t1000e_kiss_modem]
+ extends = t1000-e
+ build_src_filter = ${t1000-e.build_src_filter}
+diff --git a/variants/t1000-e/variant.h b/variants/t1000-e/variant.h
+index b95e1e4..27d6e2a 100644
+--- a/variants/t1000-e/variant.h
++++ b/variants/t1000-e/variant.h
+@@ -33,6 +33,30 @@
+ 
+ #define AREF_VOLTAGE            (3.0)
+ 
++// ---- nRF52 power management (see docs/nrf52_power_management.md) ----------
++// Below this voltage the device refuses to boot and goes straight back to
++// SYSTEMOFF, so a flat cell cannot boot-loop itself into a brownout during a
++// flash write. Matches AUTO_SHUTDOWN_MILLIVOLTS so the two thresholds agree.
++#ifndef PWRMGT_VOLTAGE_BOOTLOCK
++  #define PWRMGT_VOLTAGE_BOOTLOCK 3400   // mV
++#endif
++
++// LPCOMP wake channel: BATTERY_PIN is P0.02 = AIN0.
++#define PWRMGT_LPCOMP_AIN       0
++// REFSEL 8 = 9/16 VDD. With ADC_MULTIPLIER 2.0 the pin sees Vbat/2, so this
++// trips at roughly Vbat 3.7V.
++#define PWRMGT_LPCOMP_REFSEL    8
++
++// LPCOMP voltage wake is OFF by default on this board. The battery divider
++// sits behind the switched sensor rail (PIN_3V3_EN), so it is not established
++// that AIN0 carries a usable voltage while the device is in SYSTEMOFF with
++// that rail down. VBUS (USB) wake is unaffected and always active, which is
++// the recovery path that matters: plugging the charger in wakes the device.
++// Set this to 1 only after verifying LPCOMP wake on hardware.
++#ifndef PWRMGT_ENABLE_LPCOMP_WAKE
++  #define PWRMGT_ENABLE_LPCOMP_WAKE 0
++#endif
++
+ ////////////////////////////////////////////////////////////////////////////////
+ // Number of pins
+ 

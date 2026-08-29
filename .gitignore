@@ -1,0 +1,4 @@
+# upstream checkout created by apply.sh
+/meshcore/
+# host test binary
+/test/tc
