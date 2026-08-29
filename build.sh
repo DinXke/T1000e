@@ -10,8 +10,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MESHCORE_DIR="${MESHCORE_DIR:-$HERE/meshcore}"
 ENV_NAME="${ENV_NAME:-t1000e_companion_radio_ble_ps}"
 export FIRMWARE_VERSION="${FIRMWARE_VERSION:-t1000e-mt}"
-# Ship without debug logging; MeshCore's build.sh reads this.
-export DISABLE_DEBUG="${DISABLE_DEBUG:-1}"
+# Deliberately NOT setting DISABLE_DEBUG. MeshCore's build.sh implements it by
+# appending -UCFG_DEBUG, and the Adafruit nRF52 core needs that symbol to exist
+# (cores/nRF5/rtos.cpp: "while(CFG_DEBUG) yield();"), so it breaks the build on
+# this platform. There is nothing to strip anyway: the debug flags in this
+# env are commented out.
 
 "$HERE/apply.sh"
 
