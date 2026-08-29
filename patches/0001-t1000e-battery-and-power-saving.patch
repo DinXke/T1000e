@@ -1,5 +1,5 @@
 diff --git a/examples/companion_radio/MyMesh.cpp b/examples/companion_radio/MyMesh.cpp
-index 2c33406..d94fa41 100644
+index 2c33406..4d34d56 100644
 --- a/examples/companion_radio/MyMesh.cpp
 +++ b/examples/companion_radio/MyMesh.cpp
 @@ -1,4 +1,5 @@
@@ -87,7 +87,20 @@ index 2c33406..d94fa41 100644
      float temperature = board.getMCUTemperature();
      if(!isnan(temperature)) { // Supported boards with built-in temperature sensor. ESP32-C3 may return NAN
        telemetry.addTemperature(TELEM_CHANNEL_SELF, temperature); // Built-in MCU Temperature
-@@ -1868,6 +1908,8 @@ void MyMesh::handleCmdFrame(size_t len) {
+@@ -1834,6 +1874,12 @@ void MyMesh::handleCmdFrame(size_t len) {
+           savePrefs();
+         }
+         #endif
++        // Battery calibration has to outlive a reboot, or it is worse than
++        // useless: the reading would silently revert to the nominal divider.
++        if (strcmp(sp, "batt_cal") == 0) {
++          _prefs.adc_multiplier = board.getAdcMultiplier();
++          savePrefs();
++        }
+         writeOKFrame();
+       } else {
+         writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+@@ -1868,6 +1914,8 @@ void MyMesh::handleCmdFrame(size_t len) {
        int i = 0;
        out_frame[i++] = RESP_CODE_STATS;
        out_frame[i++] = STATS_TYPE_CORE;
@@ -96,32 +109,61 @@ index 2c33406..d94fa41 100644
        uint16_t battery_mv = board.getBattMilliVolts();
        uint32_t uptime_secs = _ms->getMillis() / 1000;
        uint8_t queue_len = (uint8_t)_mgr->getOutboundTotal();
-@@ -2050,9 +2092,61 @@ void MyMesh::checkCLIRescueCmd() {
+@@ -2050,9 +2098,94 @@ void MyMesh::checkCLIRescueCmd() {
          _prefs.ble_pin = atoi(&config[4]);
          savePrefs();
          Serial.printf("  > pin is now %06d\n", _prefs.ble_pin);
 +      } else if (memcmp(config, "batt.calibrate ", 15) == 0) {
-+        // Measure the cell with a multimeter, pass the real value in mV.
-+        // The discharge curve, the low-battery warning and the shutdown
-+        // threshold are all only as good as this number.
-+        long actual_mv = atol(&config[15]);
-+        uint16_t reported_mv = board.getBattMilliVolts();
-+        float cur_mult = board.getAdcMultiplier();
-+        if (actual_mv < 2500 || actual_mv > 4500) {
-+          Serial.println("  Error: expected a measured value between 2500 and 4500 mV");
-+        } else if (reported_mv < 1000 || cur_mult == 0.0f) {
-+          Serial.println("  Error: no usable battery reading to calibrate against");
++        // "full"  - calibrate against a terminated charger. The only route
++        //           that works on a sealed device, where nobody can reach the
++        //           cell with a multimeter.
++        // <mV>    - a measured figure, for units that can be opened.
++        // "reset" - back to the board's nominal divider.
++        const char* arg = &config[15];
++        if (strcmp(arg, "reset") == 0) {
++          board.setAdcMultiplier(0.0f);
++          _prefs.adc_multiplier = 0.0f;
++          savePrefs();
++          Serial.printf("  > back to the board default (multiplier %.4f)\n", board.getAdcMultiplier());
 +        } else {
-+          float new_mult = cur_mult * ((float) actual_mv / (float) reported_mv);
-+          if (new_mult <= 0.0f || new_mult > 10.0f) {
-+            Serial.println("  Error: implied multiplier out of range");
-+          } else if (board.setAdcMultiplier(new_mult)) {
-+            _prefs.adc_multiplier = new_mult;
-+            savePrefs();
-+            Serial.printf("  > was %u mV, now %u mV (multiplier %.4f)\n",
-+                          (unsigned) reported_mv, (unsigned) board.getBattMilliVolts(), new_mult);
++          uint16_t actual_mv = 0;
++          bool ok = true;
++          if (strcmp(arg, "full") == 0) {
++            if (!board.isChargeComplete()) {
++              Serial.println("  Error: needs USB connected and the charge finished.");
++              Serial.println("         Leave it charging until the LED stops breathing, then retry.");
++              ok = false;
++            } else {
++              actual_mv = BATT_FULL_REF_MV;
++            }
 +          } else {
-+            Serial.println("  Error: this board has no adjustable battery reading");
++            long v = atol(arg);
++            if (v <= 0) {
++              Serial.println("  Error: expected 'full', 'reset', or a measured value in mV");
++              ok = false;
++            } else if (board.isCharging()) {
++              Serial.println("  Error: still charging - that reading is not the cell's own voltage");
++              ok = false;
++            } else {
++              actual_mv = (uint16_t) v;
++            }
++          }
++          if (ok) {
++            board.invalidateBattCache();
++            uint16_t reported_mv = board.getBattMilliVolts();
++            float new_mult = battery_calibration_multiplier(board.getAdcMultiplier(), reported_mv, actual_mv);
++            if (new_mult == 0.0f) {
++              Serial.printf("  Error: %u mV against a reading of %u mV is too far out to be calibration.\n",
++                            (unsigned) actual_mv, (unsigned) reported_mv);
++              Serial.println("         Check the reference before forcing it with 'set adc.multiplier'.");
++            } else if (board.setAdcMultiplier(new_mult)) {
++              _prefs.adc_multiplier = new_mult;
++              savePrefs();
++              Serial.printf("  > was %u mV, now %u mV (multiplier %.4f)\n",
++                            (unsigned) reported_mv, (unsigned) board.getBattMilliVolts(), new_mult);
++            } else {
++              Serial.println("  Error: this board has no adjustable battery reading");
++            }
 +          }
 +        }
 +      } else if (memcmp(config, "adc.multiplier ", 15) == 0) {
@@ -155,6 +197,10 @@ index 2c33406..d94fa41 100644
 +      Serial.printf("  > stop below: %u mV\n", (unsigned) AUTO_SHUTDOWN_MILLIVOLTS);
 +#endif
 +      Serial.printf("  > external  : %s\n", board.isExternalPowered() ? "yes" : "no");
++      Serial.printf("  > charger   : %s\n",
++                    board.isCharging() ? "charging" :
++                    (board.isChargeComplete() ? "charge complete - 'set batt.calibrate full' works now"
++                                              : "not connected"));
      } else if (strcmp(cli_command, "rebuild") == 0) {
        bool success = _store->formatFileSystem();
        if (success) {
@@ -666,7 +712,7 @@ index 0d390f7..dc1af1a 100644
  }
 \ No newline at end of file
 diff --git a/variants/t1000-e/T1000eBoard.h b/variants/t1000-e/T1000eBoard.h
-index 1111d3c..e0423ea 100644
+index 1111d3c..069f280 100644
 --- a/variants/t1000-e/T1000eBoard.h
 +++ b/variants/t1000-e/T1000eBoard.h
 @@ -4,15 +4,54 @@
@@ -725,7 +771,7 @@ index 1111d3c..e0423ea 100644
    #ifdef BATTERY_PIN
     #ifdef PIN_3V3_EN
      digitalWrite(PIN_3V3_EN, HIGH);
-@@ -20,20 +59,56 @@ public:
+@@ -20,20 +59,77 @@ public:
      analogReference(AR_INTERNAL_3_0);
      analogReadResolution(12);
      delay(10);
@@ -775,6 +821,27 @@ index 1111d3c..e0423ea 100644
    #endif
    }
  
++  /* EXT_CHRG_DETECT reads LOW while the charger is pushing current and goes
++     HIGH once it terminates. "Charge complete" is therefore the one moment a
++     sealed device knows its cell voltage without anyone opening it: the
++     charger has just held it at its termination voltage. That is what makes
++     calibration possible on an IP65 unit. */
++  bool isCharging() {
++  #ifdef EXT_CHRG_DETECT
++    return isExternalPowered() && digitalRead(EXT_CHRG_DETECT) == LOW;
++  #else
++    return false;
++  #endif
++  }
++
++  bool isChargeComplete() {
++  #ifdef EXT_CHRG_DETECT
++    return isExternalPowered() && digitalRead(EXT_CHRG_DETECT) != LOW;
++  #else
++    return false;
++  #endif
++  }
++
 +  bool setAdcMultiplier(float multiplier) override {
 +    adc_mult = (multiplier == 0.0f) ? (float) ADC_MULTIPLIER : multiplier;
 +    invalidateBattCache();   // next read must not come from the old scaling
@@ -785,7 +852,7 @@ index 1111d3c..e0423ea 100644
    const char* getManufacturerName() const override {
      return "Seeed Tracker T1000-E";
    }
-@@ -50,28 +125,7 @@ public:
+@@ -50,28 +146,7 @@ public:
    }
  
    void powerOff() override {
@@ -883,6 +950,108 @@ index 8456dc9..33c8385 100644
  [env:t1000e_kiss_modem]
  extends = t1000-e
  build_src_filter = ${t1000-e.build_src_filter}
+diff --git a/variants/t1000-e/target.cpp b/variants/t1000-e/target.cpp
+index 4253282..63ace26 100644
+--- a/variants/t1000-e/target.cpp
++++ b/variants/t1000-e/target.cpp
+@@ -2,6 +2,7 @@
+ #include "t1000e_sensors.h"
+ #include "target.h"
+ #include <helpers/sensors/MicroNMEALocationProvider.h>
++#include <helpers/BatteryCurve.h>
+ 
+ T1000eBoard board;
+ 
+@@ -162,17 +163,51 @@ void T1000SensorManager::loop() {
+   }
+ }
+ 
+-int T1000SensorManager::getNumSettings() const { return 1; }  // just one supported: "gps" (power switch)
++/*
++  Settings exposed over the companion protocol's custom-variable channel, so
++  they are reachable from the phone app.
++
++  Battery calibration lives here rather than only on the USB CLI for one
++  reason: the T1000-E is a sealed IP65 unit. Nobody is going to put a
++  multimeter on its cell, and the CLI needs a USB cable plus a long button
++  press timed within 8 seconds of boot. Over the app it is a text field.
++
++    batt_mv   read-only, what the ADC currently reports
++    batt_pct  read-only, that reading through the discharge curve
++    batt_cal  write "full" while the charger shows charge-complete, or a
++              measured millivolt figure, or "reset" to go back to the board
++              default. Reads back as the multiplier in force.
++*/
++int T1000SensorManager::getNumSettings() const { return 4; }
+ 
+ const char* T1000SensorManager::getSettingName(int i) const {
+-  return i == 0 ? "gps" : NULL;
++  switch (i) {
++    case 0: return "gps";
++    case 1: return "batt_mv";
++    case 2: return "batt_pct";
++    case 3: return "batt_cal";
++  }
++  return NULL;
+ }
++
+ const char* T1000SensorManager::getSettingValue(int i) const {
+-  if (i == 0) {
+-    return gps_active ? "1" : "0";
++  static char buf[16];
++  switch (i) {
++    case 0:
++      return gps_active ? "1" : "0";
++    case 1:
++      snprintf(buf, sizeof(buf), "%u", (unsigned) board.getBattMilliVolts());
++      return buf;
++    case 2:
++      snprintf(buf, sizeof(buf), "%u", (unsigned) battery_percent_from_mv(board.getBattMilliVolts()));
++      return buf;
++    case 3:
++      snprintf(buf, sizeof(buf), "%.4f", board.getAdcMultiplier());
++      return buf;
+   }
+   return NULL;
+ }
++
+ bool T1000SensorManager::setSettingValue(const char* name, const char* value) {
+   if (strcmp(name, "gps") == 0) {
+     if (strcmp(value, "0") == 0) {
+@@ -182,5 +217,33 @@ bool T1000SensorManager::setSettingValue(const char* name, const char* value) {
+     }
+     return true;
+   }
++  if (strcmp(name, "batt_cal") == 0) {
++    if (strcmp(value, "reset") == 0) {
++      board.setAdcMultiplier(0.0f);   // 0 means "board default"
++      return true;
++    }
++
++    uint16_t actual_mv;
++    if (strcmp(value, "full") == 0) {
++      // Only meaningful the moment the charger has terminated: that is when
++      // the cell is actually sitting at its full voltage. Refuse otherwise,
++      // because calibrating mid-charge silently poisons every later reading.
++      if (!board.isChargeComplete()) return false;
++      actual_mv = BATT_FULL_REF_MV;
++    } else {
++      long v = atol(value);
++      if (v <= 0) return false;
++      // A reading taken while current is flowing is not the cell's voltage.
++      if (board.isCharging()) return false;
++      actual_mv = (uint16_t) v;
++    }
++
++    board.invalidateBattCache();   // do not calibrate against a stale sample
++    float m = battery_calibration_multiplier(board.getAdcMultiplier(),
++                                             board.getBattMilliVolts(),
++                                             actual_mv);
++    if (m == 0.0f) return false;   // rejected as implausible
++    return board.setAdcMultiplier(m);
++  }
+   return false;  // not supported
+ }
 diff --git a/variants/t1000-e/variant.h b/variants/t1000-e/variant.h
 index b95e1e4..27d6e2a 100644
 --- a/variants/t1000-e/variant.h

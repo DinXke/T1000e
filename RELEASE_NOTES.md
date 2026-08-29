@@ -74,29 +74,45 @@ vergeten in je bluetooth-instellingen en opnieuw koppelen.
 Die website serveert zijn eigen firmwarelijst; er is geen gedocumenteerde
 manier om er een eigen bestand doorheen te sturen. Gebruik voor deze build dus
 optie 1 of 2 hierboven. De `Console`-functie van die site werkt wél gewoon met
-dit toestel, en is handig voor de kalibratiestap hieronder.
+dit toestel, mocht je de kalibratie liever via USB doen.
 
 ---
 
 ## Doe dit één keer na het flashen: kalibreren
 
-Dit is de belangrijkste stap, en zonder deze stap is elk percentage een
-aanname. De spanningsmeting van de T1000-E is niet vanzelfsprekend juist, en de
-hele curve steunt erop.
+Dit is de belangrijkste stap. De spanningsmeting van de T1000-E is niet
+vanzelfsprekend juist, en de hele curve steunt erop.
 
-1. Sluit het toestel met USB aan en open een seriële terminal op 115200 baud
-   (de `Console` op flasher.meshcore.io kan dit ook).
-2. Houd de knop lang ingedrukt **binnen 8 seconden na het opstarten**. Je krijgt
-   `========= CLI Rescue =========`.
-3. Typ `batt` en lees af wat de firmware meet.
-4. Meet de celspanning met een multimeter.
-5. Typ `set batt.calibrate <gemeten mV>`, bijvoorbeeld `set batt.calibrate 3840`.
-6. Typ nogmaals `batt` om te controleren. De correctie wordt opgeslagen en
-   overleeft een herstart.
+De T1000-E is IP65 en verzegeld, dus je komt niet bij de cel met een
+multimeter. Daarom gebruikt deze firmware een referentie die je toch al hebt:
+**de lader**. Een LiPo-lader kapt af op 4,20V, en het toestel kan aan de
+`EXT_CHRG_DETECT`-pin zien wanneer dat gebeurd is. Kalibreren op elk ander
+moment wordt geweigerd, want halverwege het laden meet je de lader.
+
+### Vanuit de app — geen kabel naar een computer nodig
+
+1. Laad volledig op. Het lampje ademt tijdens het laden en wordt rustig groen
+   als hij klaar is.
+2. **Laat de USB aangesloten.**
+3. Zoek in de app bij dit knooppunt de custom variables / device settings. Je
+   ziet `batt_mv` (huidige meting), `batt_pct` (via de curve) en `batt_cal`.
+4. Zet `batt_cal` op `full`.
+5. Lees `batt_mv` opnieuw — die hoort nu rond 4200 te staan.
+
+Opgeslagen, en het overleeft een herstart.
+
+### Of via USB, als je app die velden niet toont
+
+Seriële terminal op 115200 baud (de `Console` op flasher.meshcore.io kan dit),
+knop lang ingedrukt binnen 8 seconden na opstarten voor `CLI Rescue`, dan:
+
+```
+batt                        toont de meting en of het laadmoment goed is
+set batt.calibrate full     kalibreert tegen de afgekapte lader
+set batt.calibrate reset    terug naar de standaardinstelling
+```
 
 De volledige uitleg staat in [`docs/battery.md`](docs/battery.md).
-
----
 
 ## Wat nog niet is aangetoond
 

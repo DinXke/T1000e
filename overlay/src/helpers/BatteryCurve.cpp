@@ -106,3 +106,23 @@ batt_action_t battery_watch_step(batt_watch_state_t* st,
 
   return BATT_ACTION_NONE;
 }
+
+float battery_calibration_multiplier(float current_mult,
+                                     uint16_t reported_mv,
+                                     uint16_t actual_mv) {
+  /* A reference outside this band is not a single LiPo cell. */
+  if (actual_mv < 2500 || actual_mv > 4500) return 0.0f;
+  /* No usable reading to correct. */
+  if (reported_mv < 1000) return 0.0f;
+  if (current_mult <= 0.0f) return 0.0f;
+
+  float m = current_mult * ((float) actual_mv / (float) reported_mv);
+
+  /* A divider that is out by more than a third is not a calibration problem,
+     it is a wiring or hardware problem, and silently scaling every future
+     reading by that factor would hide it. */
+  if (m < current_mult * 0.67f || m > current_mult * 1.5f) return 0.0f;
+  if (m <= 0.0f || m > 10.0f) return 0.0f;
+
+  return m;
+}

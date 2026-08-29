@@ -107,6 +107,44 @@ int main() {
     CHECK(st8.low_streak >= N, "streak must saturate, not wrap to 0");
   }
 
+
+  // ---- calibration maths ----------------------------------------------------
+  {
+    // A sealed T1000-E calibrates against a terminated charger: the firmware
+    // reads low, the cell is really at 4200mV.
+    float m = battery_calibration_multiplier(2.0f, 4020, 4200);
+    CHECK(m > 0.0f, "a plausible correction must be accepted");
+    // after correction, the same raw sample should read the reference back
+    CHECK((int)(4020 * (m / 2.0f) + 0.5f) == 4200, "corrected reading must land on the reference, got %d", (int)(4020 * (m / 2.0f) + 0.5f));
+
+    // no correction needed
+    CHECK(battery_calibration_multiplier(2.0f, 4200, 4200) == 2.0f, "an exact reading must leave the multiplier alone");
+
+    // references that are not a single LiPo cell
+    CHECK(battery_calibration_multiplier(2.0f, 4000, 1200) == 0.0f, "reject a reference below a cell");
+    CHECK(battery_calibration_multiplier(2.0f, 4000, 5000) == 0.0f, "reject a reference above a cell");
+    CHECK(battery_calibration_multiplier(2.0f, 4000, 0) == 0.0f, "reject a zero reference");
+
+    // no usable reading to correct
+    CHECK(battery_calibration_multiplier(2.0f, 0, 4200) == 0.0f, "reject a missing reading");
+    CHECK(battery_calibration_multiplier(2.0f, 500, 4200) == 0.0f, "reject an implausible reading");
+    CHECK(battery_calibration_multiplier(0.0f, 4000, 4200) == 0.0f, "reject a zero current multiplier");
+
+    // a wildly wrong pairing is a hardware fault, not a calibration offset --
+    // scaling by it would hide the fault behind plausible-looking numbers
+    CHECK(battery_calibration_multiplier(2.0f, 2600, 4200) == 0.0f, "reject a correction far too large");
+    CHECK(battery_calibration_multiplier(2.0f, 4400, 2600) == 0.0f, "reject a correction far too small");
+
+    // the accepted band still covers a realistically bad divider (~10%)
+    CHECK(battery_calibration_multiplier(2.0f, 3820, 4200) > 0.0f, "a 10%% divider error must still calibrate");
+
+    // and the result stays sane
+    for (int rep = 3200; rep <= 4400; rep += 10) {
+      float mm = battery_calibration_multiplier(2.0f, (uint16_t)rep, 4200);
+      CHECK(mm == 0.0f || (mm > 0.0f && mm <= 10.0f), "multiplier out of range at %d: %f", rep, mm);
+    }
+  }
+
   printf("\n  mV   curve%%  stock%%  spoofed mV\n");
   for (int mv = 4200; mv >= 3300; mv -= 50) {
     printf("  %4d   %3u     %3d     %4u\n", mv, battery_percent_from_mv(mv), linear_percent(mv), battery_display_mv(mv));

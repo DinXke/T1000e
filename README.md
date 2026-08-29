@@ -50,8 +50,8 @@ beweerd.
 ## Documentatie
 
 * [`docs/battery.md`](docs/battery.md) — wat er mis was, wat de curve doet,
-  hoe de spoofing werkt en **hoe je kalibreert** (lees dit voordat je de
-  drempels vertrouwt);
+  hoe de spoofing werkt en **hoe je kalibreert zonder de behuizing te openen**
+  (lees dit voordat je de drempels vertrouwt);
 * [`docs/power-saving.md`](docs/power-saving.md) — wat er precies zuiniger is,
   wat het kost, en wat er bewust níét in zit;
 * [`NOTICE.md`](NOTICE.md) — herkomst en licenties, inclusief de vraag of er
@@ -66,7 +66,7 @@ beweerd.
 | batterijpercentage in het protocol | niet aanwezig | byte 11 van `PACKET_BATTERY` |
 | lage-batterijwaarschuwing | geen | deuntje + melding onder 3400 mV |
 | automatisch uitschakelen | geen | onder 3200 mV, na 3 metingen op rij |
-| ADC-kalibratie | niet ondersteund op dit board | `set batt.calibrate <mV>`, opgeslagen |
+| ADC-kalibratie | niet ondersteund op dit board | tegen de afgekapte lader, vanuit de app of de CLI |
 | BLE-adverteren in rust | elke 152,5 ms | elke 1000 ms |
 | BLE-verbinding in rust | 15–30 ms | 100–200 ms, latency 4 |
 | batterijmeting | elke aanroep, 1 sample | 1× per 8 s, mediaan van 5 |
@@ -89,8 +89,8 @@ Gebouwd en getest in CI ([run #3](https://github.com/DinXke/T1000e/actions/runs/
 * dat het op hardware doet wat het hoort te doen. Het is gecompileerd, niet
   gevlogen. Flash eerst op een toestel dat je kunt missen;
 * **de juistheid van de spanningsmeting**. Zie `docs/battery.md` — kalibreer
-  met een multimeter voordat je de drempels vertrouwt. Zonder die stap is elk
-  percentage hier een aanname;
+  tegen een afgekapte lader voordat je de drempels vertrouwt. Zonder die stap
+  is elk percentage hier een aanname;
 * de daadwerkelijke stroomwinst in mA. De ingrepen zijn onderbouwd met wat de
   radio aantoonbaar minder doet, niet met een meting;
 * of LPCOMP-wake op dit board werkt. Daarom staat die uit; VBUS-wake (lader

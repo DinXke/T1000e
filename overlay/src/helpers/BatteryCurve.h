@@ -93,6 +93,21 @@ uint16_t battery_percent_to_linear_mv(uint8_t percent);
    applies the linear map. Passes 0 through unchanged. */
 uint16_t battery_display_mv(uint16_t true_mv);
 
+/* Voltage a healthy LiPo sits at once its charger has terminated. Used as the
+   reference for calibrating a sealed device, where the cell terminals are not
+   reachable and a charger is the only trustworthy known voltage available. */
+#ifndef BATT_FULL_REF_MV
+  #define BATT_FULL_REF_MV  4200
+#endif
+
+/* New ADC multiplier that would make a reading of reported_mv come out as
+   actual_mv. Returns 0 when the inputs cannot give a trustworthy answer:
+   an implausible reference, a missing reading, or an implied correction so
+   large that it is more likely a mistake than a miscalibrated divider. */
+float battery_calibration_multiplier(float current_mult,
+                                     uint16_t reported_mv,
+                                     uint16_t actual_mv);
+
 /* ---------------------------------------------------------------------------
    Low-battery decision logic.
 

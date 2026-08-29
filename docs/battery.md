@@ -119,26 +119,70 @@ board niet vanzelfsprekend juist. Er is een concrete aanwijzing dat er iets
 scheef zit: een gezonde LiPo hangt het grootste deel van zijn leven rond
 3,80–4,00V, maar dit toestel meldt dagenlang ~3,66V. Dat past bij een deler die
 structureel 150–200 mV te laag leest, en het past net zo goed bij een cel die
-werkelijk zo laag staat. Zonder multimeter is dat niet uit elkaar te houden.
+werkelijk zo laag staat.
 
-Daarom implementeert deze firmware wat de T1000-E niet had: een instelbare,
-**opgeslagen** ADC-correctie. In de standaard-firmware doet `set adc.multiplier`
-op dit board niets (`variant.h` zet `BATTERY_IMMUTABLE`, wat overigens nergens
-in de code wordt gelezen, en het board implementeerde `setAdcMultiplier()`
-simpelweg niet).
+**De T1000-E is IP65 en verzegeld.** Je komt niet bij de celaansluitingen, dus
+"meet even met een multimeter" is geen bruikbaar advies. Daarom gebruikt deze
+firmware een referentie die je toch al in huis hebt: **de lader zelf**.
 
-Zo doe je het, één keer per toestel:
+### De referentie: een lader die klaar is
 
-1. Sluit de T1000-E met USB aan en open een seriële terminal (115200 baud).
-2. Houd de knop lang ingedrukt **binnen 8 seconden na het opstarten** — dat
-   opent de CLI (`========= CLI Rescue =========`).
-3. Typ `batt` en lees af wat de firmware meet.
-4. Meet de celspanning met een multimeter.
-5. Typ `set batt.calibrate <gemeten mV>`, bijvoorbeeld `set batt.calibrate 3840`.
-6. `batt` nogmaals: de meting hoort nu te kloppen. De correctie staat in de
-   voorkeuren en overleeft een herstart.
+Een LiPo-lader stopt bij een vaste eindspanning, in de praktijk 4,20V binnen
+ongeveer een procent. Op het moment dat het laden klaar is, weet je dus wat de
+cel doet — zonder iets open te maken.
 
-Handmatig kan ook: `set adc.multiplier <getal>` (standaard 2.0).
+De T1000-E heeft daar hardware voor: `EXT_CHRG_DETECT` (P1.3) is LAAG zolang de
+lader stroom levert en gaat HOOG zodra hij afkapt. De firmware leest die pin en
+weigert te kalibreren op elk ander moment, want kalibreren halverwege het laden
+zet je metingen er blijvend naast zonder dat je het merkt.
+
+### Zo doe je het — vanuit de app, geen kabel naar een computer
+
+Dit is de aanbevolen route op een verzegeld toestel.
+
+1. Laad de T1000-E volledig op. Het statuslampje ademt tijdens het laden en
+   wordt rustig groen als hij klaar is.
+2. **Laat de USB aangesloten.**
+3. Open in de MeshCore-app de instellingen van dit knooppunt en zoek de
+   custom variables / device settings. Je ziet daar:
+
+   | naam | betekenis |
+   |---|---|
+   | `batt_mv` | wat de firmware nu meet |
+   | `batt_pct` | dat, door de ontlaadcurve |
+   | `batt_cal` | de correctiefactor die nu geldt |
+
+4. Zet `batt_cal` op `full`.
+5. Lees `batt_mv` opnieuw: die hoort nu rond 4200 te staan.
+
+Klaar. De correctie wordt opgeslagen en overleeft een herstart.
+
+Ziet de app die velden niet, dan kan hetzelfde via USB — zie hieronder.
+
+### Zelfde ding via de USB-CLI
+
+1. Sluit de T1000-E met USB aan en open een seriële terminal op 115200 baud.
+   De `Console` op flasher.meshcore.io kan dit ook.
+2. Houd de knop lang ingedrukt **binnen 8 seconden na het opstarten**. Je krijgt
+   `========= CLI Rescue =========`.
+3. `batt` — de regel `charger` vertelt je of het moment goed is.
+4. `set batt.calibrate full`
+
+### Andere mogelijkheden
+
+* `set batt.calibrate 3840` of `batt_cal` = `3840` — als je op een of andere
+  manier wél een gemeten waarde hebt. Wordt geweigerd zolang de lader stroom
+  levert, want dan meet je de lader en niet de cel.
+* `set batt.calibrate reset` of `batt_cal` = `reset` — terug naar de nominale
+  deler van het board.
+* `set adc.multiplier <getal>` — de factor rechtstreeks zetten (standaard 2.0).
+
+### Wanneer een kalibratie geweigerd wordt
+
+De firmware accepteert alleen correcties tot ongeveer een derde omhoog of
+omlaag. Zit het verder uit elkaar, dan is het geen scheve deler maar iets
+anders — een defecte cel, een verkeerd referentiegetal — en dat hoor je te
+zien in plaats van weg te schalen achter geloofwaardig ogende getallen.
 
 **Kalibreer vóórdat je de drempels aanpast.** Als de meting 180 mV te laag is,
 schakelt een drempel van 3200 het toestel uit terwijl de cel nog op 3,38V staat.
