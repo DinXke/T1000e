@@ -74,14 +74,24 @@ beweerd.
 
 ## Status
 
-De curve, de spoofing-omrekening en de afsluitlogica zijn met tests
-onderbouwd. De patch is geverifieerd tegen een schone `d929643`-checkout.
+Gebouwd en getest in CI ([run #3](https://github.com/DinXke/T1000e/actions/runs/33270524295)):
 
-De volledige firmware is **nog niet gecompileerd** in de omgeving waarin dit is
-geschreven — de PlatformIO-registry was daar door het netwerkbeleid geblokkeerd.
-De CI-workflow is er precies voor om dat wél te doen; laat die één keer lopen
-voordat je flasht.
+* de patch applyt schoon op een verse `d929643`-clone, en levert byte-identiek
+  de tree op die is getest;
+* de firmware compileert en linkt — RAM 61,6% (145.000 van 235.520 bytes),
+  flash 49,3% (349.576 van 708.608 bytes), dus ruim binnen de grenzen;
+* `.uf2` (699 KB) en `.zip` (350 KB) hangen als artefact aan de run;
+* de hosttests op de ontlaadcurve en de beslislogica van de batterijbewaker
+  zijn groen.
 
-Verder ongemeten en dus onbewezen: de daadwerkelijke stroomwinst in mA, en of
-de LPCOMP-wake op dit board werkt (daarom staat die uit). Zie
-`docs/power-saving.md`.
+**Wat hiermee nog niet is aangetoond**, en waar je zelf naar moet kijken:
+
+* dat het op hardware doet wat het hoort te doen. Het is gecompileerd, niet
+  gevlogen. Flash eerst op een toestel dat je kunt missen;
+* **de juistheid van de spanningsmeting**. Zie `docs/battery.md` — kalibreer
+  met een multimeter voordat je de drempels vertrouwt. Zonder die stap is elk
+  percentage hier een aanname;
+* de daadwerkelijke stroomwinst in mA. De ingrepen zijn onderbouwd met wat de
+  radio aantoonbaar minder doet, niet met een meting;
+* of LPCOMP-wake op dit board werkt. Daarom staat die uit; VBUS-wake (lader
+  insteken) werkt wel.
